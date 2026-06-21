@@ -1,0 +1,134 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 'Version bump type'
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+        default: 'patch'
+      dry_run:
+        description: 'Dry run (print what would happen, no push)'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Compute new version
+        id: version
+        run: |
+          CURRENT=$(python3 -c "import re; f=open('hermes_cctv/__init__.py').read(); m=re.search(r'__version__\s*=\s*[\"\\'](.+?)[\"\\']', f); print(m.group(1))")
+          echo "Current version: $CURRENT"
+
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+
+          case "${{ inputs.bump }}" in
+            major) NEW="$((MAJOR + 1)).0.0" ;;
+            minor) NEW="$MAJOR.$((MINOR + 1)).0" ;;
+            patch) NEW="$MAJOR.$MINOR.$((PATCH + 1))" ;;
+          esac
+
+          echo "New version: $NEW"
+          echo "new_version=$NEW" >> $GITHUB_OUTPUT
+          echo "current_version=$CURRENT" >> $GITHUB_OUTPUT
+
+      - name: Bump version in files
+        if: ${{ !inputs.dry_run }}
+        run: |
+          NEW="${{ steps.version.outputs.new_version }}"
+          # Update __init__.py
+          sed -i "s/__version__ = \".*\"/__version__ = \"$NEW\"/" hermes_cctv/__init__.py
+          # Update pyproject.toml
+          sed -i "s/^version = \".*\"/version = \"$NEW\"/" pyproject.toml
+          echo "Version bumped to $NEW in __init__.py and pyproject.toml"
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          if [ -z "$LAST_TAG" ]; then
+            RANGE=""
+            echo "No previous tag found — generating changelog from all commits"
+          else
+            RANGE="$LAST_TAG..HEAD"
+            echo "Generating changelog since $LAST_TAG"
+          fi
+
+          echo '## Changes' > CHANGELOG_TEMP.md
+          echo '' >> CHANGELOG_TEMP.md
+
+          # Group commits by conventional commit type
+          for TYPE in feat fix refactor docs chore test ci; do
+            COMMITS=$(git log $RANGE --pretty=format:"- %s (%h)" --grep="^$TYPE:" --no-merges 2>/dev/null || true)
+            if [ -n "$COMMITS" ]; then
+              LABEL=$(echo "$TYPE" | sed 's/feat/✨ Features/; s/fix/🐛 Fixes/; s/refactor/🔧 Refactoring/; s/docs/📚 Docs/; s/chore/🧹 Chores/; s/test/✅ Tests/; s/ci/⚙️ CI/')
+              echo "### $LABEL" >> CHANGELOG_TEMP.md
+              echo "$COMMITS" >> CHANGELOG_TEMP.md
+              echo '' >> CHANGELOG_TEMP.md
+            fi
+          done
+
+          # Fallback: any non-conventional commits
+          OTHER=$(git log $RANGE --pretty=format:"- %s (%h)" --no-merges 2>/dev/null | grep -vE '^\s*$' | grep -vE '^(feat|fix|refactor|docs|chore|test|ci):' || true)
+          if [ -n "$OTHER" ]; then
+            echo "### 📦 Other" >> CHANGELOG_TEMP.md
+            echo "$OTHER" >> CHANGELOG_TEMP.md
+            echo '' >> CHANGELOG_TEMP.md
+          fi
+
+          cat CHANGELOG_TEMP.md
+          echo "changelog_file=CHANGELOG_TEMP.md" >> $GITHUB_OUTPUT
+
+      - name: Commit, tag, and push
+        if: ${{ !inputs.dry_run }}
+        run: |
+          NEW="${{ steps.version.outputs.new_version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add hermes_cctv/__init__.py pyproject.toml
+          git commit -m "chore: bump version to $NEW"
+          git tag -a "v$NEW" -m "Release v$NEW"
+          git push origin main --follow-tags
+
+      - name: Create GitHub Release
+        if: ${{ !inputs.dry_run }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.new_version }}
+          name: v${{ steps.version.outputs.new_version }}
+          body_path: CHANGELOG_TEMP.md
+          generate_release_notes: false
+
+      - name: Dry run summary
+        if: ${{ inputs.dry_run }}
+        run: |
+          echo "=============================="
+          echo "DRY RUN — no changes made"
+          echo "=============================="
+          echo "Would bump: ${{ steps.version.outputs.current_version }} → ${{ steps.version.outputs.new_version }}"
+          echo "Would tag:  v${{ steps.version.outputs.new_version }}"
+          echo ""
+          echo "Changelog preview:"
+          cat CHANGELOG_TEMP.md

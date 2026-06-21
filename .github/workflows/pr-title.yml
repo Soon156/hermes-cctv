@@ -1,0 +1,23 @@
+name: PR Title Check
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize]
+
+jobs:
+  check-title:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate conventional commit format
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          if echo "$TITLE" | grep -qE '^(feat|fix|docs|chore|refactor|test|ci)(\(.+\))?!?: .+'; then
+            echo "✅ PR title follows conventional commits: $TITLE"
+          else
+            echo "❌ PR title must follow conventional commits format."
+            echo "   Expected: type: description"
+            echo "   Example:  feat: add motion detection sensitivity slider"
+            echo "   Types:    feat, fix, docs, chore, refactor, test, ci"
+            exit 1
+          fi

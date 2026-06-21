@@ -1,0 +1,31 @@
+camera:
+  device_id: 0
+  width: 1280
+  height: 720
+  fps: 30
+
+motion:
+  enabled: true
+  threshold: 30          # Pixel difference threshold (0-255, lower = more sensitive)
+  min_area: 2500         # Minimum contour area in pixels to count as motion
+  blur_kernel: 21        # Gaussian blur kernel size (odd number)
+  dilate_iterations: 2   # Dilate the diff mask to merge fragmented blobs (0 = off)
+  confirm_frames: 3      # Consecutive frames of motion required before triggering
+
+recording:
+  # Paths: use ~/ for home dir (macOS/Linux → /Users/you or /home/you,
+  # Windows → C:\Users\you).  Absolute paths also accepted.
+  # Relative/dynamic paths (./clips, $HOME/clips) are NOT supported.
+  # output_dir: ~/hermes-cctv/clips
+  # snapshot_dir: ~/hermes-cctv/snapshots
+  pre_motion_buffer: 2
+  post_motion_padding: 15
+  codec: h264               # h264 (H.264/AVC), hevc (H.265/HEVC), vp9, av1
+  max_clip_seconds: 300    # 5 min — cap splits clip during active motion, resumes immediately
+  max_storage_mb: 500
+  audio_enabled: true
+  audio_device: ":1"       # AVFoundation audio device
+
+hermes:
+  # control_file: ~/.hermes/cctv/control
+  # events_file: ~/.hermes/cctv/events.jsonl

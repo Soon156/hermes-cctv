@@ -1,0 +1,384 @@
+#!/usr/bin/env bash
+# hermes-cctv — cross-platform daemon lifecycle CLI
+#   hermes-cctv install    Install/re-register background service (launchd / systemd / Startup)
+#   hermes-cctv start      Start the daemon now
+#   hermes-cctv pause      Stop the daemon now; auto-start stays → resumes on next boot
+#   hermes-cctv stop       Stop the daemon now AND remove auto-start (won't resume on boot)
+#   hermes-cctv restart    Bounce the daemon (keeps auto-start)
+#   hermes-cctv status     Check if installed / running
+#   remove / revoke / uninstall are aliases for stop
+set -euo pipefail
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+ok()   { printf "  ${GREEN}✓${NC} %s\n" "$1"; }
+warn() { printf "  ${YELLOW}⚠${NC} %s\n" "$1"; }
+err()  { printf "  ${RED}✗${NC} %s\n" "$1"; exit 1; }
+
+PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
+OS="$(uname -s)"
+
+resolve_python() {
+    if [ -f "$PROJECT_DIR/venv/bin/python3" ]; then
+        echo "$PROJECT_DIR/venv/bin/python3"
+    elif [ -f "$PROJECT_DIR/venv/Scripts/python.exe" ]; then
+        echo "$PROJECT_DIR/venv/Scripts/python.exe"
+    else
+        err "Python venv not found. Run setup.sh first."
+    fi
+}
+
+banner() {
+    echo ""
+    printf "${CYAN}${BOLD}hermes-cctv — %s${NC}\n" "$1"
+    printf "  OS:      %s\n" "$OS"
+    printf "  Project: %s\n" "$PROJECT_DIR"
+    echo ""
+}
+
+# ══════════════════════════════════════════════════════════
+# macOS
+# ══════════════════════════════════════════════════════════
+SVC_MACOS="com.hermes.cctv"
+PLIST_MACOS="$HOME/Library/LaunchAgents/${SVC_MACOS}.plist"
+
+install_macos() {
+    PYTHON="$(resolve_python)"
+    # Re-register cleanly: unload any existing instance first so a rerun
+    # picks up changes instead of stacking a stale definition.
+    [ -f "$PLIST_MACOS" ] && launchctl unload "$PLIST_MACOS" 2>/dev/null || true
+    cat > "$PLIST_MACOS" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>$SVC_MACOS</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$PYTHON</string>
+        <string>-m</string>
+        <string>hermes_cctv.cctv</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>$PROJECT_DIR</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>$HOME/Library/Logs/hermes-cctv.log</string>
+    <key>StandardErrorPath</key>
+    <string>$HOME/Library/Logs/hermes-cctv-error.log</string>
+</dict>
+</plist>
+EOF
+    launchctl load "$PLIST_MACOS" 2>/dev/null || true
+    ok "Installed — starts on login, restarts if crashed"
+}
+
+# stop = kill the daemon AND remove auto-start (won't resume on boot).
+stop_macos() {
+    launchctl unload "$PLIST_MACOS" 2>/dev/null || true
+    rm -f "$PLIST_MACOS"
+    pkill -f "hermes_cctv.cctv" 2>/dev/null || true  # also catch a manual run
+    ok "Stopped — daemon killed and auto-start removed (won't resume on boot)"
+}
+
+# pause = kill the daemon now but keep the plist so login auto-starts it again.
+# Unload (not just 'stop') so KeepAlive can't immediately respawn it.
+pause_macos() {
+    if [ -f "$PLIST_MACOS" ]; then
+        launchctl unload "$PLIST_MACOS" 2>/dev/null || true
+        ok "Paused — daemon stopped; will resume on next login"
+    elif pgrep -f "hermes_cctv.cctv" > /dev/null 2>&1; then
+        pkill -f "hermes_cctv.cctv" 2>/dev/null || true
+        ok "Stopped (was running this boot only — nothing registered to resume)"
+    else
+        warn "Not running"
+    fi
+}
+
+start_macos() {
+    if [ -f "$PLIST_MACOS" ]; then
+        if launchctl list 2>/dev/null | grep -q "$SVC_MACOS"; then
+            launchctl start "$SVC_MACOS" 2>/dev/null && ok "Started" || warn "Could not start"
+        else
+            # Was paused (unloaded) — RunAtLoad starts it on load.
+            launchctl load "$PLIST_MACOS" 2>/dev/null && ok "Started" || warn "Could not start"
+        fi
+        return
+    fi
+    # Not registered — run for this boot only (won't auto-start after reboot).
+    if pgrep -f "hermes_cctv.cctv" > /dev/null 2>&1; then
+        warn "Already running"; return
+    fi
+    PYTHON="$(resolve_python)"
+    ( cd "$PROJECT_DIR" && nohup "$PYTHON" -m hermes_cctv.cctv \
+        > "$HOME/Library/Logs/hermes-cctv.log" 2>&1 & )
+    ok "Started (this boot only — run 'hermes-cctv install' for auto-start)"
+}
+
+restart_macos() {
+    if [ -f "$PLIST_MACOS" ]; then
+        launchctl unload "$PLIST_MACOS" 2>/dev/null || true
+        sleep 1
+        launchctl load "$PLIST_MACOS" 2>/dev/null || true
+        ok "Restarted"
+    else
+        warn "Not installed — run: hermes-cctv install"
+    fi
+}
+
+status_macos() {
+    if launchctl list 2>/dev/null | grep -q "$SVC_MACOS"; then
+        ok "Running"
+    elif [ -f "$PLIST_MACOS" ]; then
+        warn "Installed but not running — run: hermes-cctv start"
+    elif pgrep -f "hermes_cctv.cctv" > /dev/null 2>&1; then
+        ok "Running (this boot only — not registered for auto-start)"
+    else
+        warn "Not installed — run: hermes-cctv install"
+    fi
+}
+
+# ══════════════════════════════════════════════════════════
+# Linux
+# ══════════════════════════════════════════════════════════
+SVC_LINUX="hermes-cctv"
+SERVICE_FILE="$HOME/.config/systemd/user/${SVC_LINUX}.service"
+
+install_linux() {
+    PYTHON="$(resolve_python)"
+    mkdir -p "$(dirname "$SERVICE_FILE")"
+    cat > "$SERVICE_FILE" <<EOF
+[Unit]
+Description=Hermes CCTV Daemon
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=$PROJECT_DIR
+ExecStart=$PYTHON -m hermes_cctv.cctv
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+EOF
+    systemctl --user daemon-reload
+    systemctl --user enable "$SVC_LINUX" 2>/dev/null || true
+    # Re-register cleanly: (re)start so a rerun picks up changes.
+    systemctl --user restart "$SVC_LINUX" 2>/dev/null \
+        || systemctl --user start "$SVC_LINUX" 2>/dev/null || true
+    ok "Installed — starts on login, restarts if crashed"
+}
+
+# stop = kill the daemon AND disable auto-start (won't resume on boot).
+stop_linux() {
+    systemctl --user stop "$SVC_LINUX" 2>/dev/null || true
+    systemctl --user disable "$SVC_LINUX" 2>/dev/null || true
+    rm -f "$SERVICE_FILE"
+    systemctl --user daemon-reload 2>/dev/null || true
+    pkill -f "hermes_cctv.cctv" 2>/dev/null || true
+    ok "Stopped — daemon killed and auto-start removed (won't resume on boot)"
+}
+
+# pause = stop now but stay enabled so it resumes on next login.
+# systemd does NOT honor Restart= for an intentional 'stop', so this sticks.
+pause_linux() {
+    if systemctl --user is-active --quiet "$SVC_LINUX" 2>/dev/null; then
+        systemctl --user stop "$SVC_LINUX" \
+            && ok "Paused — stopped; will resume on next login (still enabled)"
+    else
+        pkill -f "hermes_cctv.cctv" 2>/dev/null \
+            && ok "Paused (manual process stopped)" || warn "Not running"
+    fi
+}
+
+start_linux() {
+    if [ -f "$SERVICE_FILE" ]; then
+        systemctl --user start "$SVC_LINUX" && ok "Started"
+        return
+    fi
+    # Not registered — run for this boot only (won't auto-start after reboot).
+    if pgrep -f "hermes_cctv.cctv" > /dev/null 2>&1; then
+        warn "Already running"; return
+    fi
+    PYTHON="$(resolve_python)"
+    ( cd "$PROJECT_DIR" && nohup "$PYTHON" -m hermes_cctv.cctv \
+        > "$PROJECT_DIR/cctv.log" 2>&1 & )
+    ok "Started (this boot only — run 'hermes-cctv install' for auto-start)"
+}
+
+restart_linux() {
+    if [ -f "$SERVICE_FILE" ]; then
+        systemctl --user restart "$SVC_LINUX" && ok "Restarted"
+    else
+        pkill -f "hermes_cctv.cctv" 2>/dev/null || true
+        sleep 1
+        start_linux
+    fi
+}
+
+status_linux() {
+    if systemctl --user is-active --quiet "$SVC_LINUX" 2>/dev/null; then
+        ok "Running"
+    elif systemctl --user is-enabled --quiet "$SVC_LINUX" 2>/dev/null; then
+        warn "Installed but not running — run: hermes-cctv start"
+    elif [ -f "$SERVICE_FILE" ]; then
+        warn "Installed but not enabled"
+    else
+        # Check for manual process
+        if pgrep -f "hermes_cctv.cctv" > /dev/null 2>&1; then
+            ok "Running (manual process)"
+        else
+            warn "Not installed — run: hermes-cctv install"
+        fi
+    fi
+}
+
+# ══════════════════════════════════════════════════════════
+# Windows
+# ══════════════════════════════════════════════════════════
+resolve_startup_dir() {
+    if [ -n "${APPDATA:-}" ]; then
+        echo "$APPDATA/Microsoft/Windows/Start Menu/Programs/Startup"
+    elif [ -n "${USERPROFILE:-}" ]; then
+        echo "$USERPROFILE/AppData/Roaming/Microsoft/Windows/Start Menu/Programs/Startup"
+    else
+        err "Cannot find Windows Startup folder"
+    fi
+}
+
+install_windows() {
+    PYTHON="$(resolve_python)"
+    STARTUP_DIR="$(resolve_startup_dir)"
+    mkdir -p "$STARTUP_DIR" 2>/dev/null || true
+    VBS="$STARTUP_DIR/hermes-cctv.vbs"
+    PROJ_WIN="$(cygpath -w "$PROJECT_DIR" 2>/dev/null || echo "$PROJECT_DIR")"
+    PY_WIN="$(cygpath -w "$PYTHON" 2>/dev/null || echo "$PYTHON")"
+    cat > "$VBS" <<EOF
+' Hermes CCTV — Auto-start launcher
+Set WshShell = CreateObject("WScript.Shell")
+WshShell.CurrentDirectory = "$PROJ_WIN"
+WshShell.Run "cmd /c ""$PY_WIN"" -m hermes_cctv.cctv >> ""$PROJ_WIN\\cctv.log"" 2>&1", 0, False
+Set WshShell = Nothing
+EOF
+    ok "Installed — starts on login"
+}
+
+# stop = kill the daemon AND remove the Startup launcher (won't resume on login).
+stop_windows() {
+    pkill -f "hermes_cctv.cctv" 2>/dev/null || true
+    STARTUP_DIR="$(resolve_startup_dir)"
+    rm -f "$STARTUP_DIR/hermes-cctv.vbs"
+    ok "Stopped — daemon killed and auto-start removed (won't resume on login)"
+}
+
+# pause = kill the daemon now but keep the Startup launcher → resumes on next login.
+pause_windows() {
+    if pgrep -f "hermes_cctv.cctv" > /dev/null 2>&1; then
+        pkill -f "hermes_cctv.cctv" 2>/dev/null || true
+        ok "Paused — daemon stopped; will resume on next login"
+    else
+        warn "Not running"
+    fi
+}
+
+start_windows() {
+    if pgrep -f "hermes_cctv.cctv" > /dev/null 2>&1; then
+        warn "Already running"; return
+    fi
+    PYTHON="$(resolve_python)"
+    PROJ_WIN="$(cygpath -w "$PROJECT_DIR" 2>/dev/null || echo "$PROJECT_DIR")"
+    # Run from the project dir so config.yaml is found. With the Startup
+    # launcher present this auto-starts on login; without it, this boot only.
+    cmd /c "cd /d \"$PROJ_WIN\" && start /b \"\" \"$PYTHON\" -m hermes_cctv.cctv > \"$PROJ_WIN\\cctv.log\" 2>&1" 2>/dev/null &
+    ok "Started (background)"
+    echo "  Logs: $PROJECT_DIR/cctv.log"
+}
+
+restart_windows() {
+    pkill -f "hermes_cctv.cctv" 2>/dev/null || true
+    sleep 1
+    start_windows
+}
+
+status_windows() {
+    if pgrep -f "hermes_cctv.cctv" > /dev/null 2>&1; then
+        ok "Running"
+    else
+        STARTUP_DIR="$(resolve_startup_dir)"
+        if [ -f "$STARTUP_DIR/hermes-cctv.vbs" ]; then
+            warn "Installed but not running — run: hermes-cctv start"
+        else
+            warn "Not installed — run: hermes-cctv install"
+        fi
+    fi
+}
+
+# ══════════════════════════════════════════════════════════
+# Dispatch
+# ══════════════════════════════════════════════════════════
+ACTION="${1:-}"
+
+usage() {
+    echo "Usage: hermes-cctv <command>"
+    echo ""
+    echo "  install   Install / re-register as background service (auto-start on login)"
+    echo "  start     Start the daemon now"
+    echo "  pause     Stop the daemon now; auto-start stays → resumes on next boot"
+    echo "  stop      Stop the daemon now AND remove auto-start (won't resume on boot)"
+    echo "  restart   Bounce the daemon (keeps auto-start)"
+    echo "  status    Check if installed / running"
+    echo ""
+    echo "  remove | revoke | uninstall   Aliases for stop"
+    exit 1
+}
+
+case "$ACTION" in
+    install)                     banner "install" ;;
+    start)                       banner "start" ;;
+    pause)                       banner "pause" ;;
+    stop)                        banner "stop" ;;
+    remove|uninstall|revoke) ACTION=stop; banner "stop" ;;
+    restart)                     banner "restart" ;;
+    status)                      banner "status" ;;
+    *) usage ;;
+esac
+
+dispatch() {
+    case "$OS" in
+        Darwin)
+            case "$ACTION" in
+                install) install_macos ;;
+                start)   start_macos   ;; pause)   pause_macos ;;
+                stop)    stop_macos    ;; restart) restart_macos ;;
+                status)  status_macos  ;;
+            esac ;;
+        Linux)
+            if [ "$ACTION" = "install" ] && [ -f /proc/sys/fs/binfmt_misc/WSLInterop ] 2>/dev/null; then
+                warn "WSL detected — systemd may not be available"
+            fi
+            case "$ACTION" in
+                install) install_linux ;;
+                start)   start_linux   ;; pause)   pause_linux ;;
+                stop)    stop_linux    ;; restart) restart_linux ;;
+                status)  status_linux  ;;
+            esac ;;
+        MINGW*|MSYS*|CYGWIN*)
+            case "$ACTION" in
+                install) install_windows ;;
+                start)   start_windows   ;; pause)   pause_windows ;;
+                stop)    stop_windows    ;; restart) restart_windows ;;
+                status)  status_windows  ;;
+            esac ;;
+        *) err "Unsupported OS: $OS" ;;
+    esac
+}
+
+dispatch
+echo ""
+ok "Done."
